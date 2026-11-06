@@ -23,10 +23,10 @@ The Gold layer exists to answer these four questions. Everything upstream serves
 
 ```mermaid
 flowchart LR
-    A[AESO Public API] -->|run_ingestion.py| B[(UC Volume<br/>landing/raw_files)]
+    A[AESO Public API] -->|ingestion.py<br/>hourly job| B[(UC Volume<br/>landing/raw_files)]
     C[AESO historical<br/>CSD files] -->|backfill| B
     B -->|Auto Loader| D[Bronze<br/>raw responses]
-    D -->|expectations +<br/>AUTO CDC| E[Silver<br/>facts + SCD2 dims]
+    D -->|expectations +<br/>AUTO CDC<br/>6-hourly job| E[Silver<br/>facts + SCD2 dims]
     E -->|materialized views| F[Gold<br/>business answers]
     F --> G[AI/BI dashboard<br/>+ Genie]
 ```
@@ -88,6 +88,21 @@ Full reasoning for every design choice is in [docs/decisions.md](docs/decisions.
 
 ---
 
+## Orchestration
+
+Two Lakeflow Jobs, decoupled by the landing Volume:
+
+| Job | Schedule (UTC) | Does |
+|---|---|---|
+| `ab_power_ingest` | every hour at :05 | Pulls all four AESO feeds and lands raw JSON |
+| `ab_power_pipeline_refresh` | every 6 hours at :20 | Runs Bronze → Silver over everything landed since the last run |
+
+Ingestion is cheap and runs hourly so no generation snapshot is missed. The pipeline is the expensive step and runs less often without losing data, because Auto Loader picks up every file landed in between. Schedules use UTC so daylight-saving changes never skip or repeat a run. Both jobs retry automatically and alert by email on failure.
+
+![Ingestion job run history](docs/images/11_job_runs.png)
+
+---
+
 ## Repository structure
 
 ```
@@ -131,8 +146,11 @@ Grants are set at schema level, so every future table inherits them. See [sql/01
    databricks secrets create-scope ab_power
    databricks secrets put-secret ab_power aeso_api_key --string-value "<your key>"
    ```
-4. Run `src/ingestion/run_ingestion.py` to land the first files.
-5. Create a Lakeflow Declarative Pipeline with source folder `src/pipelines/`, default catalog `ab_power`, serverless compute, and the configuration `spark.sql.session.timeZone = UTC`. Run it.
+4. Create a Lakeflow Declarative Pipeline with source folder `src/pipelines/`, default catalog `ab_power`, serverless compute, and the configuration `spark.sql.session.timeZone = UTC`.
+5. Create the two jobs described under [Orchestration](#orchestration):
+   - `ab_power_ingest`: Python script task on `src/ingestion/ingestion.py`, serverless, cron `0 5 * * * ?` (UTC), 2 retries.
+   - `ab_power_pipeline_refresh`: Pipeline task on the pipeline above, cron `0 20 0/6 * * ?` (UTC), 1 retry.
+6. Click **Run now** on the ingestion job, then on the pipeline job, to load the first data without waiting for the schedule.
 
 ---
 
@@ -142,7 +160,7 @@ Grants are set at schema level, so every future table inherits them. See [sql/01
 - [x] API ingestion into a UC Volume
 - [x] Bronze: incremental Auto Loader ingestion
 - [x] Silver: expectations, AUTO CDC deduplication, normalized SCD2 asset model
-- [ ] Hourly scheduled job (ingestion → pipeline)
+- [x] Hourly scheduled job (ingestion → pipeline)
 - [ ] Gold: materialized views for the four business questions
 - [ ] Historical CSD backfill
 - [ ] Delta deep dive: time travel, `RESTORE`, Change Data Feed

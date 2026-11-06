@@ -1,31 +1,44 @@
-# Databricks notebook source
 # Ingestion runner: pulls each AESO feed and lands the raw JSON in the Volume.
 # One file per dataset per run, named with a UTC timestamp so nothing is overwritten.
-
-# COMMAND ----------
+# Runs as a Python script task in the ab_power_ingest job (serverless).
 
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
+import sys
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from databricks.sdk.runtime import dbutils
+
+
+def _script_dir() -> str:
+    """Folder containing this script. On serverless jobs the script runs via exec(),
+    so __file__ is undefined and the path is taken from sys.argv[0] instead."""
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+# Make sibling modules importable when run as a job script
+sys.path.insert(0, _script_dir())
 
 from aeso_api_client import AESOClient, ENDPOINTS
 
 LANDING_ROOT = "/Volumes/ab_power/landing/raw_files/api"
 
-# COMMAND ----------
-
 api_key = dbutils.secrets.get(scope="ab_power", key="aeso_api_key")
 client = AESOClient(api_key)
 
+# File names use UTC so they sort correctly and never repeat across DST changes.
 run_ts = datetime.now(timezone.utc)
 run_id = run_ts.strftime("%Y%m%dT%H%M%SZ")
 
-# Re-pull yesterday as well as today: AESO revises recent hours,
-# and the overlap catches late corrections. Silver deduplicates.
-today = date.today()
-start, end = today - timedelta(days=1), today
-
-# COMMAND ----------
+# AESO's startDate/endDate are Alberta calendar dates. Use Alberta's date, not UTC's:
+# from 17:00/18:00 local time onward, UTC is already on tomorrow's date.
+# Re-pull yesterday as well as today: AESO revises recent hours. Silver deduplicates.
+alberta_today = datetime.now(ZoneInfo("America/Edmonton")).date()
+start, end = alberta_today - timedelta(days=1), alberta_today
 
 results = {}
 for dataset, (_, mode) in ENDPOINTS.items():
@@ -46,9 +59,7 @@ for dataset, (_, mode) in ENDPOINTS.items():
 for dataset, status in results.items():
     print(f"{dataset:12s} {status}")
 
-# COMMAND ----------
-
-# Fail the run loudly if any feed failed, so the job shows red and alerts fire.
+# Fail the run loudly if any feed failed, so the job shows red, retries, and alerts fire.
 failed = [d for d, s in results.items() if s.startswith("FAILED")]
 if failed:
     raise RuntimeError(f"Ingestion failed for: {failed}")
