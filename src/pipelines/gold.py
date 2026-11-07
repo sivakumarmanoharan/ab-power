@@ -3,7 +3,7 @@
 '''
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark import pipelines as dp
+import dlt
 
 SPIKE_MULTIPLIER = 3.0
 SPIKE_FLOOR = 100.0
@@ -12,7 +12,7 @@ SPIKE_FLOOR = 100.0
 ONE_HOUR = F.expr("INTERVAL 1 HOUR")
 
 
-@dp.table(
+@dlt.table(
     name='pp_spike_data',
     comment=f"One row per price spike event: a run of consecutive hours with price > "
         f"{SPIKE_MULTIPLIER:g}x the rolling 30-day average and > ${SPIKE_FLOOR:g}/MWh. "
