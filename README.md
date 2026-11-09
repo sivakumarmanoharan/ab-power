@@ -2,7 +2,7 @@
 
 A governed lakehouse on Databricks that ingests live data from the Alberta Electric System Operator (AESO), models it through a medallion architecture with declarative pipelines and data quality contracts, and tracks the province's generating assets and market participants as SCD Type 2 history.
 
-**Stack:** Databricks (Free Edition, serverless) · Unity Catalog · Auto Loader · Lakeflow Declarative Pipelines · AUTO CDC · Delta Lake · Python · SQL
+**Stack:** Databricks (Free Edition, serverless) · Unity Catalog · Auto Loader · Lakeflow Declarative Pipelines · AUTO CDC · Lakeflow Jobs · Delta Lake · Python · SQL
 
 ![Pipeline graph](docs/images/04_pipeline_graph.png)
 
@@ -36,7 +36,7 @@ flowchart LR
 | **Landing** | Raw JSON from the API, one file per feed per run, named with a UTC run timestamp | UC Volume |
 | **Bronze** | One row per landed file, payload exactly as received, plus ingestion metadata (`_ingested_at`, `_source_file`, `_batch_id`) | Streaming tables |
 | **Silver** | Typed, validated, deduplicated facts; normalized SCD Type 2 asset model | Streaming tables (AUTO CDC) |
-| **Gold** | Aggregations answering the business questions | Materialized views |
+| **Gold** | Business-ready tables answering the four questions | Materialized views |
 
 ### Silver data model
 
@@ -48,6 +48,20 @@ flowchart LR
 | `dim_asset` | one row per asset version | SCD Type 2 |
 | `dim_participant` | one row per participant version | SCD Type 2 |
 | `bridge_asset_participant` | one row per asset–participant pair version | SCD Type 2, keys only |
+
+### Gold data model
+
+| Table | Grain | Answers | Status |
+|---|---|---|---|
+| `fact_hourly_market` | one row per UTC hour | Price, load, forecast error, local-time attributes, spike flag. The only place the spike rule is defined. | ✅ Built |
+| `agg_price_spike_events` | one row per spike event | Q1: when spikes happen and what demand was doing | ✅ Built |
+| `fact_hourly_generation_by_fuel` | one row per hour per fuel type | Base for Q2 | Planned |
+| `fact_hourly_supply` | one row per hour | Wind, solar, gas, storage, supply cushion; Q1 causes, Q2, Q4 | Planned |
+| `agg_generator_performance` | one row per asset per month | Q3: capacity factor, ranked within fuel type | Planned |
+| `agg_wind_drop_price_response` | one row per sharp wind drop | Q4 | Planned |
+| `dim_asset_current` | one row per asset | Current asset, owner and participants in one table for analysts | Planned |
+
+A **spike hour** is one where the price is more than **3× AESO's rolling 30-day average** and above **$100/MWh**. The relative condition adapts to high- and low-price periods; the floor stops small moves in very cheap periods from counting. A **spike event** is a run of consecutive spike hours, derived with a gaps-and-islands pattern, because the source data contains no events.
 
 ---
 
@@ -71,10 +85,12 @@ Every Silver feed has expectations at three deliberate severities:
 
 ![Data quality metrics](docs/images/06_data_quality_expectations.png)
 
-### Daylight saving time
-AESO publishes both UTC and Mountain Prevailing Time. On November 1, 2026, clocks fell back and one local hour occurred twice. Silver is keyed on UTC, so both hours are kept as distinct records. Local time is stored as `TIMESTAMP_NTZ` for analysis, never as a key.
+### Time zones
+AESO publishes both UTC and Alberta local time. Silver is keyed on UTC, and local time is stored as `TIMESTAMP_NTZ` for analysis, never as a key. Gold derives local time from the UTC key with the `America/Edmonton` time zone, so the two can never disagree.
 
-![DST fall-back hour](docs/images/07_dst_fallback_hour.png)
+This mattered sooner than expected. Alberta moved to permanent daylight time in 2026, so clocks did not fall back on November 1, 2026, and the province now stays at UTC−6 year-round. A Gold acceptance test written on the old rules expected a repeated 1 a.m. hour and failed. Checking it against AESO's own local timestamps showed the data was right and the assumption was out of date. Because every table is keyed on UTC, the rule change needed no code change. Historical data from before 2026 still contains real daylight-saving transitions, which the same design handles without duplicates.
+
+![UTC to local time across Nov 1, 2026](docs/images/07_timezone_check.png)
 
 ### Findings from real data
 Two duplicate-key failures in the SCD2 flows exposed facts about the source that shaped the model:
@@ -88,6 +104,20 @@ Full reasoning for every design choice is in [docs/decisions.md](docs/decisions.
 
 ---
 
+## First results
+
+**Sunday, November 1, 2026, 4 p.m. to 9 p.m. Alberta time:** a 5-hour price spike, peaking at **$553.43/MWh** and averaging **$323.50**, several times the normal price level.
+
+| Measure | Value |
+|---|---|
+| Average load during the event | 11,045 MW |
+| Peak load | 11,109 MW |
+| Demand forecast error | −31 MW (about 0.3% below forecast) |
+
+Demand was normal and forecast almost exactly, so this spike was **not demand-driven**. Supply-side causes are likely: the event spans sunset, when solar output falls to zero, and evening demand rises. Generation data does not yet cover this date, so wind and supply conditions cannot be confirmed for this event. The planned `fact_hourly_supply` table and the historical backfill address this.
+
+---
+
 ## Orchestration
 
 Two Lakeflow Jobs, decoupled by the landing Volume:
@@ -95,9 +125,9 @@ Two Lakeflow Jobs, decoupled by the landing Volume:
 | Job | Schedule (UTC) | Does |
 |---|---|---|
 | `ab_power_ingest` | every hour at :05 | Pulls all four AESO feeds and lands raw JSON |
-| `ab_power_pipeline_refresh` | every 6 hours at :20 | Runs Bronze → Silver over everything landed since the last run |
+| `ab_power_pipeline_refresh` | every 6 hours at :20 | Runs Bronze → Silver → Gold over everything landed since the last run |
 
-Ingestion is cheap and runs hourly so no generation snapshot is missed. The pipeline is the expensive step and runs less often without losing data, because Auto Loader picks up every file landed in between. Schedules use UTC so daylight-saving changes never skip or repeat a run. Both jobs retry automatically and alert by email on failure.
+Ingestion is cheap and runs hourly so no generation snapshot is missed. The pipeline is the expensive step and runs less often without losing data, because Auto Loader picks up every file landed in between. Schedules use UTC, so changes to local time rules never skip or repeat a run. Both jobs retry automatically and alert by email on failure.
 
 ![Ingestion job run history](docs/images/11_job_runs.png)
 
@@ -112,10 +142,11 @@ Ingestion is cheap and runs hourly so no generation snapshot is missed. The pipe
 ├── src/
 │   ├── ingestion/
 │   │   ├── aeso_api_client.py    # API client with retries and backoff
-│   │   └── run_ingestion.py      # lands raw JSON in the Volume
+│   │   └── ingestion.py          # job script: lands raw JSON in the Volume
 │   └── pipelines/
 │       ├── bronze.py             # Auto Loader streaming tables
-│       └── silver.py             # expectations, AUTO CDC, SCD2 model
+│       ├── silver.py             # expectations, AUTO CDC, SCD2 model
+│       └── gold.py               # materialized views answering the business questions
 ├── docs/
 │   ├── decisions.md              # architecture decision records
 │   └── images/                   # screenshots used in this README
@@ -160,9 +191,14 @@ Grants are set at schema level, so every future table inherits them. See [sql/01
 - [x] API ingestion into a UC Volume
 - [x] Bronze: incremental Auto Loader ingestion
 - [x] Silver: expectations, AUTO CDC deduplication, normalized SCD2 asset model
-- [x] Hourly scheduled job (ingestion → pipeline)
+- [x] Scheduled jobs: hourly ingestion, 6-hourly pipeline refresh
 - [ ] Gold: materialized views for the four business questions
-- [ ] Historical CSD backfill
+  - [x] `fact_hourly_market` and `agg_price_spike_events` (Q1)
+  - [ ] `dim_asset_current`
+  - [ ] `Supply and generation tables` (Q1 causes, Q2)
+  - [ ] `agg_generator_performance` (Q3)
+  - [ ] `agg_wind_drop_price_response` (Q4)
+- [ ] Historical backfill: price and load from the API; generation from CSD files
 - [ ] Delta deep dive: time travel, `RESTORE`, Change Data Feed
 - [ ] Cost and reliability monitoring with system tables
 - [ ] CI/CD with Databricks Asset Bundles and GitHub Actions
