@@ -11,9 +11,54 @@ SPIKE_FLOOR = 100.0
 
 ONE_HOUR = F.expr("INTERVAL 1 HOUR")
 
+@dlt.table(
+    name="ab_power.gold.fact_hourly_market",
+    comment=(
+        "One row per UTC hour: pool price, Alberta Internal Load, forecast error, "
+        "Alberta local-time attributes and the spike flag. "
+        "Single source of truth for the spike rule."
+    ),
+    table_properties={"quality": "gold"},
+)
+def fact_hourly_market():
+    pool_price = spark.read.table("ab_power.silver.pool_price").select(
+        "begin_datetime_utc", "pool_price", "rolling_30day_avg"
+    )
+    internal_load = spark.read.table("ab_power.silver.alberta_internal_load").select(
+        "begin_datetime_utc", "alberta_internal_load", "forecast_alberta_internal_load"
+    )
+
+    return (
+        # LEFT JOIN: every price hour is kept even if load is missing
+        pool_price.join(internal_load, on="begin_datetime_utc", how="left")
+        # Local time is derived from the UTC key, so it can never disagree with it
+        .withColumn("begin_datetime_local",
+                    F.from_utc_timestamp("begin_datetime_utc", "America/Edmonton"))
+        .withColumn("hour_of_day_local", F.hour("begin_datetime_local"))
+        .withColumn("day_of_week_local", F.date_format("begin_datetime_local", "EEEE"))
+        # Positive = demand came in above forecast
+        .withColumn("forecast_error_mw",
+                    F.col("alberta_internal_load") - F.col("forecast_alberta_internal_load"))
+        # Missing 30-day average -> not a spike (False, not NULL), so downstream logic is predictable
+        .withColumn(
+            "is_spike",
+            F.coalesce(
+                (F.col("pool_price") > SPIKE_MULTIPLIER * F.col("rolling_30day_avg"))
+                & (F.col("pool_price") > SPIKE_FLOOR),
+                F.lit(False),
+            ),
+        )
+        .select(
+            "begin_datetime_utc", "begin_datetime_local", "hour_of_day_local", "day_of_week_local",
+            "pool_price", "rolling_30day_avg",
+            "alberta_internal_load", "forecast_alberta_internal_load", "forecast_error_mw",
+            "is_spike",
+        )
+    )
+
 
 @dlt.table(
-    name='pp_spike_data',
+    name='ab_power.gold.agg_price_spike_events',
     comment=f"One row per price spike event: a run of consecutive hours with price > "
         f"{SPIKE_MULTIPLIER:g}x the rolling 30-day average and > ${SPIKE_FLOOR:g}/MWh. "
         f"Includes demand and forecast error during the event.",
@@ -22,24 +67,18 @@ ONE_HOUR = F.expr("INTERVAL 1 HOUR")
     }
 )
 def agg_price_spike_events():
-    price = (
-        spark.read.table("ab_power.silver.pool_price")
-        .select('begin_datetime_utc', 'pool_price', 'rolling_30day_avg')
-    )
-
-    load = spark.read.table("ab_power.silver.alberta_internal_load").select(
-        "begin_datetime_utc", "alberta_internal_load", "forecast_alberta_internal_load"
-    )
 
     flagged_data = (
-        price.join(
-            load,
-            on="begin_datetime_utc",
-            how='left'
+        spark.read.table("ab_power.gold.fact_hourly_market")
+        .select(
+            "begin_datetime_utc",
+            "begin_datetime_local",
+            "pool_price",
+            "alberta_internal_load",
+            "forecast_alberta_internal_load",
+            "forecast_error_mw",
+            "is_spike",
         )
-        .withColumn("is_spike",
-        (F.col("pool_price") > SPIKE_MULTIPLIER * F.col("rolling_30day_avg"))
-        & (F.col("pool_price") > SPIKE_FLOOR))
     )
 
     by_hour = Window.orderBy("begin_datetime_utc")
@@ -71,6 +110,7 @@ def agg_price_spike_events():
         .groupBy("event_id")
         .agg(
             F.min("begin_datetime_utc").alias("event_start_utc"),
+            F.min("begin_datetime_local").alias("event_start_local"),
             (F.max("begin_datetime_utc") + ONE_HOUR).alias("event_end_utc"),
             F.count("*").alias("duration_hours"),
             F.max("pool_price").alias("peak_price"),
