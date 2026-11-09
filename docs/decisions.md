@@ -32,8 +32,8 @@ Each record states the context, the decision, and its consequences, including th
 
 Two different clocks are used deliberately:
 
-- **File names use UTC**, so they sort correctly and never repeat or skip across daylight-saving changes.
-- **API date parameters use Alberta's calendar date** (`America/Edmonton`). AESO's `startDate` and `endDate` are Alberta dates. Serverless compute runs in UTC, and from late afternoon Alberta time onward UTC is already on the next day, so using the server's date would have requested a date that doesn't exist yet in Alberta on every evening run.
+- **File names use UTC**, so they sort correctly and never repeat or skip when local time rules change.
+- **API date parameters use Alberta's calendar date** (`America/Edmonton`). AESO's `startDate` and `endDate` are Alberta dates. Serverless compute runs in UTC, and from 6 p.m. Alberta time onward UTC is already on the next day, so using the server's date would have requested a date that doesn't exist yet in Alberta on every evening run.
 
 **Consequences.** Files are never overwritten, and each one is processed exactly once downstream. The overlap catches AESO's revisions to recent hours, at the cost of duplicates that Silver removes (ADR-009). The run fails loudly if any feed fails, so the scheduled job shows the failure, retries, and alerts. The date bug would not have appeared in daytime manual runs; it only surfaces once ingestion runs around the clock.
 
@@ -65,19 +65,23 @@ The script runs as a **Python script task** on serverless. Two consequences of t
 
 **Context.** Lakeflow offers both streaming tables and materialized views.
 
-**Decision.** Bronze and Silver are **streaming tables**. Gold will be **materialized views**.
+**Decision.** Bronze and Silver are **streaming tables**. Gold tables are **materialized views**, created by reading Silver with batch reads (`spark.read`).
 
 **Consequences.** Streaming tables process each input exactly once: Auto Loader tracks landed files, and AUTO CDC requires a streaming table as its target. Gold aggregates span all of history and must stay correct when upstream hours are revised, which is what materialized views guarantee. "Streaming" here describes how data is processed, not how often: the pipeline is triggered and stops after each run.
 
 ---
 
-## ADR-007: UTC as the time key; local time as `TIMESTAMP_NTZ`
+## ADR-007: UTC as the time key; local time derived, never a key
 
-**Context.** AESO publishes timestamps in both UTC and Mountain Prevailing Time (MPT). On the November fall-back date, one local hour occurs twice.
+**Context.** AESO publishes timestamps in both UTC and Alberta local time (MPT). Local time is not a stable identifier: under daylight saving, one autumn hour repeats and one spring hour is skipped, and the rules themselves are set by law and can change.
 
-**Decision.** All hourly tables are keyed on `begin_datetime_utc`. MPT is kept as `TIMESTAMP_NTZ`, a wall-clock value with no timezone, and is never used as a key. The pipeline session timezone is pinned to UTC.
+**Decision.** All hourly tables are keyed on `begin_datetime_utc`. Silver keeps AESO's local time as `TIMESTAMP_NTZ`, a wall-clock value with no time zone, for analysis only. Gold derives local time from the UTC key using the `America/Edmonton` time zone, so the two can never disagree. The pipeline session time zone is pinned to UTC.
 
-**Consequences.** Data for November 1, 2026 confirmed it: one local hour appears twice in `silver.pool_price` as two distinct UTC hours, and both are preserved. Keying on MPT would have silently merged two different hours. A plain `TIMESTAMP` for MPT would have been converted to UTC by Spark, and a string would have lost date functions. `TIMESTAMP_NTZ` requires the `delta.feature.timestampNtz` table feature, which is enabled in each table's properties.
+**Consequences.** The design was tested by a real rule change. Alberta adopted permanent daylight time in 2026, so clocks did not fall back on November 1, 2026, and the province now stays at UTC−6 year-round. A Gold acceptance test expected a repeated 1 a.m. hour that day and failed. Comparing against AESO's own local timestamps showed a constant six-hour offset: the data was correct and the test's assumption was out of date. Because keys are UTC, no table or code needed to change.
+
+The conversion relies on the platform's time zone database being current; an outdated database would silently apply the old rules. Local time is therefore validated against the source's own local timestamps, not just computed. Historical data from before 2026 still contains real fall-back and spring-forward hours (for example, November 2, 2025), which UTC keys handle without duplicates.
+
+A plain `TIMESTAMP` for local time would have been converted to UTC by Spark, and a string would have lost date functions. `TIMESTAMP_NTZ` requires the `delta.feature.timestampNtz` table feature, enabled in each table's properties.
 
 ---
 
@@ -127,7 +131,7 @@ The script runs as a **Python script task** on serverless. Two consequences of t
 - `dim_participant`: one row per participant.
 - `bridge_asset_participant`: asset and participant **IDs only**.
 
-**Consequences.** Each fact lives in exactly one place. A participant rename creates one new version in `dim_participant` instead of one per asset in the bridge. Generation joins to `dim_asset` only, so it is never double-counted. Reporting generation by participant requires a business rule for shared assets like NX01, to be decided in Gold. Gold will expose a denormalized view so analysts don't write the three-way join themselves.
+**Consequences.** Each fact lives in exactly one place. A participant rename creates one new version in `dim_participant` instead of one per asset in the bridge. Generation joins to `dim_asset` only, so it is never double-counted. Reporting generation by participant requires a business rule for shared assets like NX01, to be decided in Gold. Gold will expose `dim_asset_current`, a denormalized table, so analysts don't write the three-way join themselves.
 
 ---
 
@@ -160,11 +164,41 @@ The script runs as a **Python script task** on serverless. Two consequences of t
 | Job | Schedule (UTC) | Task | Retries |
 |---|---|---|---|
 | `ab_power_ingest` | every hour at :05 (`0 5 * * * ?`) | Python script `ingestion.py` | 2, 5 min apart |
-| `ab_power_pipeline_refresh` | every 6 hours at :20 (`0 20 0/6 * * ?`) | Pipeline `ab_power_market_pipeline`, no full refresh | 1, 10 min apart |
+| `ab_power_pipeline_refresh` | every 6 hours at :20 (`0 20 0/6 * * ?`) | Pipeline `ab_power_market_pipeline` (Bronze → Silver → Gold), no full refresh | 1, 10 min apart |
 
-Both schedules use **UTC**, so daylight-saving changes never skip or repeat a run. Both notify by email on failure. The pipeline runs at :20 so it never starts while that hour's ingestion is still writing files.
+Both schedules use **UTC**, so changes to local time rules never skip or repeat a run. Both notify by email on failure. The pipeline runs at :20 so it never starts while that hour's ingestion is still writing files.
 
-**Consequences.** The landing Volume decouples the two jobs: Auto Loader processes every file landed since the last pipeline run, so no data is lost between refreshes. Silver is up to 6 hours behind the source, which is acceptable for analytical use. Asset registry changes are timestamped at pipeline-run precision, because the snapshot flow reads only the latest asset snapshot per run. Registry changes are rare, so this is an acceptable trade-off for the cost saving.
+**Consequences.** The landing Volume decouples the two jobs: Auto Loader processes every file landed since the last pipeline run, so no data is lost between refreshes. Silver and Gold are up to 6 hours behind the source, which is acceptable for analytical use. Asset registry changes are timestamped at pipeline-run precision, because the snapshot flow reads only the latest asset snapshot per run. Registry changes are rare, so this is an acceptable trade-off for the cost saving.
+
+---
+
+## ADR-015: Spike definition: relative threshold with an absolute floor
+
+**Context.** Question 1 asks when price spikes happen. A fixed threshold such as $500/MWh measures how expensive an hour is, not how unusual: it fires constantly in high-price periods and misses dramatic jumps in low-price periods. A purely relative threshold has the opposite weakness: when prices are very low, small moves look large (with an $8 average, 3× is only $24).
+
+**Decision.** An hour is a **spike** when `pool_price > 3 × rolling_30day_avg` **and** `pool_price > $100/MWh`. AESO's own rolling 30-day average is the baseline. The multiplier and floor are named constants (`SPIKE_MULTIPLIER`, `SPIKE_FLOOR`) at the top of `gold.py` and appear in the table comment in Unity Catalog. An hour with no 30-day average is treated as **not a spike** (`False`, not `NULL`), so downstream logic such as "previous hour was not a spike" behaves predictably.
+
+**Consequences.** The rule adapts to the price level of each period and ignores immaterial moves. Both thresholds are judgement calls; changing them changes every downstream result, which is why they live in one place (ADR-016).
+
+---
+
+## ADR-016: `fact_hourly_market` as the single source of the spike rule
+
+**Context.** The first spike-events table joined price and load and calculated the spike rule itself. Upcoming tables (supply analysis, wind-drop analysis) need the same hourly view. Each recalculating it would define the spike rule in several places that could silently drift apart.
+
+**Decision.** `gold.fact_hourly_market` holds one row per UTC hour with price, load, forecast error, local-time attributes and `is_spike`. It **LEFT JOINs** load onto price, so every price hour is kept even when load is missing. `agg_price_spike_events` and every later table read `is_spike` from it rather than recalculating.
+
+**Consequences.** The spike rule exists in exactly one place, and the pipeline graph shows a chain (Silver → `fact_hourly_market` → `agg_price_spike_events`) instead of parallel copies. Acceptance tests were based on facts already verified: row count equals Silver's hour count, no duplicate hours, local time matches AESO's own local timestamps, and the known spike hours of November 1, 2026 are flagged.
+
+---
+
+## ADR-017: Spike events derived with gaps-and-islands
+
+**Context.** The source contains spike *hours* but no spike *events*. Three consecutive spike hours are one event, not three.
+
+**Decision.** Events are derived in layers: flag each hour; compare it with the previous hour (`LAG`); mark an event start where a spike hour follows a normal hour, is the first hour, or follows a **gap in the data** (previous hour not exactly one hour earlier); number events with a running count of starts; then group. Each event reports start, end (last hour's start + 1 hour), duration, peak and average price, average and peak load, and average forecast error.
+
+**Consequences.** The gap check prevents two spikes either side of a missing hour from merging into one event. Working on continuous UTC timestamps rather than calendar dates keeps events that cross midnight UTC intact. `event_id` is a sequence number recalculated on every refresh, so it shifts if an earlier hour is revised; **`event_start_utc` is the stable identifier** and is what other tables and dashboards should reference.
 
 ---
 
@@ -174,3 +208,5 @@ Both schedules use **UTC**, so daylight-saving changes never skip or repeat a ru
 - **SCD2 history begins at the first pull.** Changes before that date are not recoverable from the API.
 - **Asset changes have 6-hour precision** (ADR-014).
 - **Name normalization collisions** are theoretically possible (ADR-005).
+- **Local time depends on the platform's time zone database** being current (ADR-007).
+- **Spike causes cannot yet be confirmed** for events before generation data begins; the planned supply tables and historical backfill address this.
