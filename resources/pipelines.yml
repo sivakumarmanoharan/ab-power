@@ -1,0 +1,23 @@
+resources:
+  pipelines:
+    ab_power_market_pipeline:
+      name: ab_power_market_pipeline
+      catalog: ${var.catalog}
+      schema: bronze            # default schema; every table name in code is schema-qualified
+      serverless: true
+      photon: true
+      channel: CURRENT
+      configuration:
+        spark.sql.session.timeZone: UTC                          # ADR-007
+        landing_root: /Volumes/${var.catalog}/landing/raw_files  # read by bronze.py
+      libraries:
+        - file:
+            path: ../src/pipelines/bronze.py
+        - file:
+            path: ../src/pipelines/silver.py
+        - file:
+            path: ../src/pipelines/gold.py
+        - file:
+            path: ../src/pipelines/quality.py
+      lifecycle:
+        prevent_destroy: true

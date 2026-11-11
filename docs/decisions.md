@@ -131,7 +131,7 @@ A plain `TIMESTAMP` for local time would have been converted to UTC by Spark, an
 - `dim_participant`: one row per participant.
 - `bridge_asset_participant`: asset and participant **IDs only**.
 
-**Consequences.** Each fact lives in exactly one place. A participant rename creates one new version in `dim_participant` instead of one per asset in the bridge. Generation joins to `dim_asset` only, so it is never double-counted. Reporting generation by participant requires a business rule for shared assets like NX01, to be decided in Gold. Gold will expose `dim_asset_current`, a denormalized table, so analysts don't write the three-way join themselves.
+**Consequences.** Each fact lives in exactly one place. A participant rename creates one new version in `dim_participant` instead of one per asset in the bridge. Generation joins to `dim_asset` only, so it is never double-counted. Reporting generation by participant requires a business rule for shared assets like NX01, to be decided in Gold. Gold exposes `dim_asset_current` (ADR-022), a denormalized table, so analysts don't write the three-way join themselves.
 
 ---
 
@@ -164,9 +164,9 @@ A plain `TIMESTAMP` for local time would have been converted to UTC by Spark, an
 | Job | Schedule (UTC) | Task | Retries |
 |---|---|---|---|
 | `ab_power_ingest` | every hour at :05 (`0 5 * * * ?`) | Python script `ingestion.py` | 2, 5 min apart |
-| `ab_power_pipeline_refresh` | every 6 hours at :20 (`0 20 0/6 * * ?`) | Pipeline `ab_power_market_pipeline` (Bronze → Silver → Gold), no full refresh | 1, 10 min apart |
+| `ab_power_pipeline_refresh` | every 6 hours at :20 (`0 20 0/6 * * ?`) | Pipeline `ab_power_market_pipeline_new` (Bronze → Silver → Gold → data quality), no full refresh | 1, 10 min apart |
 
-Both schedules use **UTC**, so changes to local time rules never skip or repeat a run. Both notify by email on failure. The pipeline runs at :20 so it never starts while that hour's ingestion is still writing files.
+Both schedules use **UTC**, so changes to local time rules never skip or repeat a run. Both notify by email on failure. Since 2026-11-11 both jobs are defined in the Asset Bundle (ADR-018). The pipeline runs at :20 so it never starts while that hour's ingestion is still writing files.
 
 **Consequences.** The landing Volume decouples the two jobs: Auto Loader processes every file landed since the last pipeline run, so no data is lost between refreshes. Silver and Gold are up to 6 hours behind the source, which is acceptable for analytical use. Asset registry changes are timestamped at pipeline-run precision, because the snapshot flow reads only the latest asset snapshot per run. Registry changes are rare, so this is an acceptable trade-off for the cost saving.
 
@@ -202,6 +202,85 @@ Both schedules use **UTC**, so changes to local time rules never skip or repeat 
 
 ---
 
+## ADR-018: Asset Bundle with dev and prod targets
+
+**Context.** The pipeline and jobs were created in the UI and ran code directly from the Databricks Git folder. Production therefore ran whatever branch the Git folder had checked out, there was no separate environment to test changes, and configuration lived only in the UI.
+
+**Decision.** Define the pipeline, both jobs, schedules, retries, alerts and pipeline configuration in a Databricks Asset Bundle (`databricks.yml`, `resources/pipeline.yml`, `resources/jobs.yml`) with two targets:
+
+| | `dev` | `prod` |
+|---|---|---|
+| Mode | `development`: resources prefixed `[dev <user>]`, schedules paused | `production`: schedules active, fixed `root_path` |
+| Catalog variable | `ab_power_dev` | `ab_power` |
+| Default target | yes | no |
+
+The catalog is a bundle variable. No catalog is hard-coded in code: pipeline tables use schema-qualified names that resolve against the pipeline's catalog; the landing path is passed as pipeline configuration (`landing_root`); the ingestion script receives `--catalog` as a job parameter. Login profiles are kept out of the bundle, so the same files can be deployed by a person or by CI.
+
+**Consequences.** The same code runs in both environments; only configuration differs. Dev writes to its own catalog and can never affect production, and because `dev` is the default target, a command without `-t` can never change production. Bundle deployments upload code from the repository, so switching branches in the Databricks Git folder no longer changes what production runs. UI edits to bundle-managed resources are overwritten on the next deploy; changes go through code and pull requests. Dev data is disposable and is rebuilt from its own landing files.
+
+---
+
+## ADR-019: Adopt existing production resources; resource keys are identity
+
+**Context.** Production resources already existed when the bundle was introduced, and the production pipeline owns tables whose SCD2 history cannot be rebuilt (ADR-013). A Lakeflow table can be managed by only one pipeline. On 2026-11-11 the production pipeline was deleted during the migration and recovered without data loss ([incident report](incidents/2026-11-11-prod-pipeline-deleted.md)).
+
+**Decision.**
+- Existing production resources are **adopted** with `bundle deployment bind`, never recreated by deploying a fresh copy. Every resource is bound **before** the first `deploy -t prod`.
+- A resource's **key** in the bundle is its identity and never changes. The display `name` may change freely. The pipeline's key is `ab_power_market_pipeline_new`.
+- `bundle summary -t <target>` is checked before any `destroy` or `unbind`, and the destroy list is read before confirming.
+- The production pipeline carries `lifecycle.prevent_destroy`, so a destroy or key change fails instead of deleting it.
+- If a production pipeline is ever deleted or recreated, its tables are **moved** to the new pipeline with `ALTER STREAMING TABLE | MATERIALIZED VIEW ... SET TBLPROPERTIES('pipelines.pipelineId' = ...)`, preserving data. They are never dropped and rebuilt.
+
+**Consequences.** Changing a key, or deploying before binding, makes the bundle create a second resource: in dev this produced a second pipeline that could not write to the first one's tables; in prod it produced a duplicate job. Both were caught and cleaned up. Moving tables requires the same user to own and run both pipelines, which holds for this project. Recovery after the incident was verified on `silver.dim_asset`: 3,756 rows with `MIN(__START_AT)` = 2026-11-04, the original history start.
+
+---
+
+## ADR-020: Configuration passed as pipeline configuration and job parameters
+
+**Context.** Serverless compute restricts `spark.conf.get()` to specific keys and raises on any other key, even when a default is given. Reading environment settings from arbitrary Spark configuration therefore fails on serverless.
+
+**Decision.** Environment settings reach code through two supported channels only:
+- **Pipeline configuration** for pipeline code: `landing_root` is set per target in `resources/pipeline.yml` and read in `bronze.py` through a helper that catches the error and falls back to the production path.
+- **Job parameters** for job scripts: `ingestion.py` receives `--catalog` and parses it with `argparse.parse_known_args`, which ignores arguments added by the platform.
+
+**Consequences.** The same code runs in dev, in prod and on serverless without edits. The fallback values match production, so a resource deployed without the setting still behaves like production rather than failing.
+
+---
+
+## ADR-021: Data quality monitoring tables: detect and alert, not block
+
+**Context.** Row-level expectations in Silver (ADR-008) cannot check whole-table properties such as "row count matches Silver", "no duplicate keys" or "every spike hour belongs to exactly one event".
+
+**Decision.** `quality.py` defines one monitoring table per Gold data product (`dq_fact_hourly_market`, `dq_price_spike_events`, `dq_asset_coverage`) plus a detail table (`dq_unmatched_generation_assets`). Each holds one row of measurements per refresh, with expectations on those measurements:
+- **Fail** when downstream answers would be wrong: duplicate keys, rows lost or added versus Silver, spike-hour reconciliation broken, event spans inconsistent.
+- **Warn** when the condition may be real: missing load, gaps in the hourly sequence, local time differing from AESO's, low generation-to-registry match.
+
+Warn thresholds are constants set just below the measured normal values, so warnings fire when quality gets worse rather than on the first run.
+
+**Consequences.** Checks run on every scheduled refresh with no extra job. They **detect and alert** rather than block: the pipeline refreshes Gold before the checks that read it, so a failing check stops the run and triggers the job's failure email, but the Gold table has already been updated. Blocking bad data would require row-level expectations on the Gold tables themselves; whole-table properties can only be checked after the table is built. The monitoring tables live in `gold`, so analysts can see how trustworthy each data product currently is. Each table shows the latest measurement only; a history of measurements would need an append-only table.
+
+---
+
+## ADR-022: `dim_asset_current` as the analyst-facing asset table
+
+**Context.** Answering "who owns this asset and what fuel does it burn?" from Silver requires joining three SCD2 tables filtered to current versions, handling assets with several participants without duplicating rows, and taking fuel type from a fourth source, the generation feed.
+
+**Decision.** `gold.dim_asset_current` holds one row per current asset: asset attributes, `current_version_since`, `participant_count`, sorted arrays of participant IDs and names, and fuel type, sub-fuel type and maximum capability from the asset's most recent generation snapshot (`row_number`, so exactly one row). Participants are aggregated to one row per asset **before** joining, and both joins are LEFT JOINs, so every current asset appears exactly once. Assets with no participants get `0` and empty arrays rather than NULL.
+
+**Consequences.** Analysts never write the SCD2 joins. Sorted arrays make the output deterministic across refreshes. Profiling the result showed only 231 of 852 active SOURCE assets (27.1%) have generation data, which led to measuring coverage from both directions in `dq_asset_coverage` before building asset-level performance analysis.
+
+---
+
+## ADR-023: Protected main branch and pull-request workflow
+
+**Context.** The project should follow the delivery practices of a team: source control, branching, review and controlled promotion to production.
+
+**Decision.** `main` is protected by a GitHub ruleset: pull request required before merging, linear history, conversation resolution required, force pushes and deletion blocked, and no bypass list. Required approvals are set to 0 because GitHub does not allow approving one's own pull request in a single-person repository. Pull requests are squash-merged, so each change is one commit on `main`. Production is deployed only from `main`.
+
+**Consequences.** Every change reaches production through a reviewed pull request, and `main`'s history reads as a changelog. Required status checks will be added once GitHub Actions runs tests and `bundle validate` on every pull request.
+
+---
+
 ## Known limitations
 
 - **Generation is a point-in-time snapshot.** Its time series is only as dense as the ingestion schedule (hourly, ADR-014) and starts from the first scheduled run. Earlier history comes from the CSD backfill.
@@ -210,3 +289,6 @@ Both schedules use **UTC**, so changes to local time rules never skip or repeat 
 - **Name normalization collisions** are theoretically possible (ADR-005).
 - **Local time depends on the platform's time zone database** being current (ADR-007).
 - **Spike causes cannot yet be confirmed** for events before generation data begins; the planned supply tables and historical backfill address this.
+- **The generation feed covers only part of the registry:** 231 of 852 active SOURCE assets (27.1%). Whether this is a coverage gap or mismatched asset codes is measured by `dq_asset_coverage` (ADR-022).
+- **Data quality checks detect, they don't block** (ADR-021).
+- **Dev holds only recent data**, landed since the dev environment was created; history lives in production.

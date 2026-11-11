@@ -3,6 +3,7 @@
 # Runs as a Python script task in the ab_power_ingest job (serverless).
 
 import json
+import argparse
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -25,7 +26,11 @@ sys.path.insert(0, _script_dir())
 
 from aeso_api_client import AESOClient, ENDPOINTS
 
-LANDING_ROOT = "/Volumes/ab_power/landing/raw_files/api"
+parser = argparse.ArgumentParser()
+parser.add_argument("--catalog", default="ab_power")
+args, _ = parser.parse_known_args()
+
+LANDING_ROOT = f"/Volumes/{args.catalog}/landing/raw_files/api"
 
 api_key = dbutils.secrets.get(scope="ab_power", key="aeso_api_key")
 client = AESOClient(api_key)

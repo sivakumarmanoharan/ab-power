@@ -12,7 +12,7 @@ SPIKE_FLOOR = 100.0
 ONE_HOUR = F.expr("INTERVAL 1 HOUR")
 
 @dlt.table(
-    name="ab_power.gold.fact_hourly_market",
+    name="gold.fact_hourly_market",
     comment=(
         "One row per UTC hour: pool price, Alberta Internal Load, forecast error, "
         "Alberta local-time attributes and the spike flag. "
@@ -21,10 +21,10 @@ ONE_HOUR = F.expr("INTERVAL 1 HOUR")
     table_properties={"quality": "gold"},
 )
 def fact_hourly_market():
-    pool_price = spark.read.table("ab_power.silver.pool_price").select(
+    pool_price = spark.read.table("silver.pool_price").select(
         "begin_datetime_utc", "pool_price", "rolling_30day_avg"
     )
-    internal_load = spark.read.table("ab_power.silver.alberta_internal_load").select(
+    internal_load = spark.read.table("silver.alberta_internal_load").select(
         "begin_datetime_utc", "alberta_internal_load", "forecast_alberta_internal_load"
     )
 
@@ -58,7 +58,7 @@ def fact_hourly_market():
 
 
 @dlt.table(
-    name='ab_power.gold.agg_price_spike_events',
+    name='gold.agg_price_spike_events',
     comment=(
         f"One row per price spike event: a run of consecutive spike hours as flagged "
         f"in gold.fact_hourly_market (see that table for the spike rule). "
@@ -72,7 +72,7 @@ def fact_hourly_market():
 def agg_price_spike_events():
 
     flagged_data = (
-        spark.read.table("ab_power.gold.fact_hourly_market")
+        spark.read.table("gold.fact_hourly_market")
         .select(
             "begin_datetime_utc",
             "begin_datetime_local",
@@ -128,7 +128,7 @@ def agg_price_spike_events():
     )
 
 @dlt.table(
-    name="ab_power.gold.dim_asset_current",
+    name="gold.dim_asset_current",
     comment=(
         "One row per asset, current state only: asset attributes, current participants, "
         "and fuel type and capability from the asset's latest generation snapshot. "
@@ -139,7 +139,7 @@ def agg_price_spike_events():
 def dim_asset_current():
     # Step 1: current version of every asset
     current_assets = (
-        spark.read.table("ab_power.silver.dim_asset")
+        spark.read.table("silver.dim_asset")
         .filter(F.col("__END_AT").isNull())
         .select(
             "asset_id", "asset_name", "asset_type", "operating_status",
@@ -150,12 +150,12 @@ def dim_asset_current():
 
     # Step 2: current participants, aggregated to ONE row per asset before joining (no fan-out)
     current_participants = (
-        spark.read.table("ab_power.silver.dim_participant")
+        spark.read.table("silver.dim_participant")
         .filter(F.col("__END_AT").isNull())
         .select("pool_participant_id", "pool_participant_name")
     )
     participants_per_asset = (
-        spark.read.table("ab_power.silver.bridge_asset_participant")
+        spark.read.table("silver.bridge_asset_participant")
         .filter(F.col("__END_AT").isNull())
         .select("asset_id", "pool_participant_id")
         .join(current_participants, on="pool_participant_id", how="left")
@@ -170,7 +170,7 @@ def dim_asset_current():
     # Step 3: each asset's most recent generation snapshot (row_number: exactly one row, no ties)
     latest_by_asset = Window.partitionBy("asset_id").orderBy(F.col("snapshot_utc").desc())
     latest_gen_row = (
-        spark.read.table("ab_power.silver.generation_snapshot")
+        spark.read.table("silver.generation_snapshot")
         .withColumn("rn", F.row_number().over(latest_by_asset))
         .filter(F.col("rn") == 1)
         .select(

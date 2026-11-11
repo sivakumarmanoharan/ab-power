@@ -3,7 +3,17 @@ import re
 from pyspark.sql import functions as F 
 from pyspark.sql.types import StructField, StructType, ArrayType, MapType, StringType
 
-LANDING = "/Volumes/ab_power/landing/raw_files"
+def pipeline_conf(key: str, default: str) -> str:
+    """Read a pipeline configuration value. Serverless raises on keys that aren't set
+    (even with a default), so fall back explicitly."""
+    try:
+        return spark.conf.get(key)
+    except Exception:
+        return default
+
+
+# Set per environment in resources/pipeline.yml; the default matches production
+LANDING = pipeline_conf("landing_root", "/Volumes/ab_power/landing/raw_files")
 API_DATASETS = ["pool_price", "load", "generation", "assets"]
 
 INVALID_CHARS = r"[ ,;{}()\n\t=]+"
@@ -47,7 +57,7 @@ def add_ingestion_metadata(df):
 
 def create_bronze_table(dataset):
     @dlt.table(
-        name = f"ab_power.bronze.{dataset}",
+        name = f"bronze.{dataset}",
         comment = f"Bronze layer table for {dataset}",
         table_properties={"quality":"bronze"}
     )
@@ -68,7 +78,7 @@ for ds in API_DATASETS:
 
 
 # @dlt.table(
-#     name = "ab_power.bronze.csd_generation_backfill",
+#     name = "bronze.csd_generation_backfill",
 #     comment="Historical CSD generation CSV files from AESO loaded as backfill",
 #     table_properties={"quality":"bronze"}
 # )

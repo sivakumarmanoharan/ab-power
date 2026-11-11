@@ -61,7 +61,7 @@ def batch_ts():
 @dlt.expect("price_within_market_bounds", "pool_price BETWEEN 0 AND 999.99")
 def pool_price_parsed():
     return (
-        spark.readStream.table("ab_power.bronze.pool_price")
+        spark.readStream.table("bronze.pool_price")
         .select(
             F.explode("return.pool_price_report").alias("r"),
             "_batch_id",
@@ -81,7 +81,7 @@ def pool_price_parsed():
 
 
 dlt.create_streaming_table(
-    name="ab_power.silver.pool_price",
+    name="silver.pool_price",
     comment="Hourly settled pool price ($/MWh). One row per hour. Latest AESO revision wins.",
     table_properties={
         "quality": "silver",
@@ -90,7 +90,7 @@ dlt.create_streaming_table(
 )
 
 dlt.create_auto_cdc_flow(
-    target="ab_power.silver.pool_price",
+    target="silver.pool_price",
     source="pool_price_parsed",
     keys=["begin_datetime_utc"],
     sequence_by=F.col("_batch_ts"),
@@ -127,7 +127,7 @@ dlt.create_auto_cdc_flow(
             "<= 0.10 * alberta_internal_load")
 def load_parsed():
     return (
-        spark.readStream.table("ab_power.bronze.load")
+        spark.readStream.table("bronze.load")
         .select(
             F.explode("return.actual_forecast_report").alias("r"),
             "_batch_id",
@@ -146,7 +146,7 @@ def load_parsed():
 
 
 dlt.create_streaming_table(
-    name="ab_power.silver.alberta_internal_load",
+    name="silver.alberta_internal_load",
     comment="Hourly Alberta Internal Load (MW), actual and forecast. Latest AESO revision wins.",
     table_properties={
         "quality": "silver",
@@ -155,7 +155,7 @@ dlt.create_streaming_table(
 )
 
 dlt.create_auto_cdc_flow(
-    target="ab_power.silver.alberta_internal_load",
+    target="silver.alberta_internal_load",
     source="load_parsed",
     keys=["begin_datetime_utc"],
     sequence_by=F.col("_batch_ts"),
@@ -171,7 +171,7 @@ dlt.create_auto_cdc_flow(
 
 def latest_asset_rows():
     """Latest asset-list snapshot, exploded to one row per entry."""
-    bronze = spark.read.table("ab_power.bronze.assets")
+    bronze = spark.read.table("bronze.assets")
     latest = bronze.agg(F.max("_batch_id").alias("_batch_id"))
     return (
         bronze.join(latest, "_batch_id")
@@ -245,40 +245,39 @@ def asset_participants_latest_snapshot():
 
 
 # SCD2 history cannot be rebuilt from Bronze, so these tables are protected from
-# full refresh. All three are temporarily "true" so they can be rebuilt once after
-# the earlier failed runs. Set all three back to "false" after the first successful run.
+# full refresh (ADR-013). A schema change requires deliberately lifting this protection.
 
 dlt.create_streaming_table(
-    name="ab_power.silver.dim_asset",
+    name="silver.dim_asset",
     comment="AESO assets, one row per asset, SCD Type 2 (__START_AT / __END_AT).",
     table_properties={"quality": "silver", "pipelines.reset.allowed": "false"},  
 )
 dlt.create_auto_cdc_from_snapshot_flow(
-    target="ab_power.silver.dim_asset",
+    target="silver.dim_asset",
     source="assets_latest_snapshot",
     keys=["asset_id"],
     stored_as_scd_type=2,
 )
 
 dlt.create_streaming_table(
-    name="ab_power.silver.dim_participant",
+    name="silver.dim_participant",
     comment="AESO pool participants, one row per participant, SCD Type 2. Current name chosen by rule; see participants_latest_snapshot.",
     table_properties={"quality": "silver", "pipelines.reset.allowed": "false"},  
 )
 dlt.create_auto_cdc_from_snapshot_flow(
-    target="ab_power.silver.dim_participant",
+    target="silver.dim_participant",
     source="participants_latest_snapshot",
     keys=["pool_participant_id"],
     stored_as_scd_type=2,
 )
 
 dlt.create_streaming_table(
-    name="ab_power.silver.bridge_asset_participant",
+    name="silver.bridge_asset_participant",
     comment="Which participants offer which assets, SCD Type 2. Keys only; attributes live in the dimensions.",
     table_properties={"quality": "silver", "pipelines.reset.allowed": "false"},  
 )
 dlt.create_auto_cdc_from_snapshot_flow(
-    target="ab_power.silver.bridge_asset_participant",
+    target="silver.bridge_asset_participant",
     source="asset_participants_latest_snapshot",
     keys=["asset_id", "pool_participant_id"],
     stored_as_scd_type=2,
@@ -300,7 +299,7 @@ dlt.create_auto_cdc_from_snapshot_flow(
             "OR net_generation <= maximum_capability * 1.05")
 def generation_parsed():
     return (
-        spark.readStream.table("ab_power.bronze.generation")
+        spark.readStream.table("bronze.generation")
         .select(
             ts_utc("`return`.last_updated_datetime_utc").alias("snapshot_utc"),
             ts_local("`return`.last_updated_datetime_mpt").alias("snapshot_mpt"),
@@ -325,7 +324,7 @@ def generation_parsed():
 
 
 dlt.create_streaming_table(
-    name="ab_power.silver.generation_snapshot",
+    name="silver.generation_snapshot",
     comment="Per-asset net generation (MW) at each AESO CSD update. One row per asset per snapshot.",
     table_properties={
         "quality": "silver",
@@ -334,7 +333,7 @@ dlt.create_streaming_table(
 )
 
 dlt.create_auto_cdc_flow(
-    target="ab_power.silver.generation_snapshot",
+    target="silver.generation_snapshot",
     source="generation_parsed",
     keys=["asset_id", "snapshot_utc"],
     sequence_by=F.col("_batch_ts"),

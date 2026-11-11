@@ -36,14 +36,14 @@ def hours_between(start_col, end_col):
 
 def current_asset_ids():
     return (
-        spark.read.table("ab_power.silver.dim_asset")
+        spark.read.table("silver.dim_asset")
         .filter(F.col("__END_AT").isNull())
         .select("asset_id")
     )
 
 
 def generation_asset_ids():
-    return spark.read.table("ab_power.silver.generation_snapshot").select("asset_id").distinct()
+    return spark.read.table("silver.generation_snapshot").select("asset_id").distinct()
 
 
 # =====================================================================
@@ -51,7 +51,7 @@ def generation_asset_ids():
 # =====================================================================
 
 @dlt.table(
-    name="ab_power.gold.dq_fact_hourly_market",
+    name="gold.dq_fact_hourly_market",
     comment=(
         "Data quality for gold.fact_hourly_market: uniqueness, reconciliation with Silver, "
         "missing load, gaps in the hourly sequence, and local time vs AESO's own local time. "
@@ -66,8 +66,8 @@ def generation_asset_ids():
 # A mismatch means the platform's time zone rules differ from AESO's (ADR-007)
 @dlt.expect("local_time_matches_aeso", "local_time_mismatches = 0")
 def dq_fact_hourly_market():
-    fact = spark.read.table("ab_power.gold.fact_hourly_market")
-    silver_price = spark.read.table("ab_power.silver.pool_price").select(
+    fact = spark.read.table("gold.fact_hourly_market")
+    silver_price = spark.read.table("silver.pool_price").select(
         "begin_datetime_utc", "begin_datetime_mpt"
     )
 
@@ -131,7 +131,7 @@ def dq_fact_hourly_market():
 # =====================================================================
 
 @dlt.table(
-    name="ab_power.gold.dq_price_spike_events",
+    name="gold.dq_price_spike_events",
     comment=(
         "Data quality for gold.agg_price_spike_events: every spike hour belongs to exactly one "
         "event, event identifiers are unique, and each event's time span matches its duration. "
@@ -146,8 +146,8 @@ def dq_fact_hourly_market():
 @dlt.expect_or_fail("event_span_matches_duration", "span_mismatches = 0")
 @dlt.expect_or_fail("events_well_formed", "invalid_events = 0")
 def dq_price_spike_events():
-    events = spark.read.table("ab_power.gold.agg_price_spike_events")
-    fact = spark.read.table("ab_power.gold.fact_hourly_market")
+    events = spark.read.table("gold.agg_price_spike_events")
+    fact = spark.read.table("gold.fact_hourly_market")
 
     event_stats = events.agg(
         F.count("*").alias("events"),
@@ -205,7 +205,7 @@ def dq_price_spike_events():
 # =====================================================================
 
 @dlt.table(
-    name="ab_power.gold.dq_asset_coverage",
+    name="gold.dq_asset_coverage",
     comment=(
         "Data quality for gold.dim_asset_current (uniqueness, reconciliation with Silver, "
         "participant arrays) and coverage between silver.dim_asset and "
@@ -221,7 +221,7 @@ def dq_price_spike_events():
 @dlt.expect("every_participant_has_a_name", "participants_without_name = 0")
 @dlt.expect("generation_assets_match_registry", f"generation_match_pct >= {MIN_GENERATION_MATCH_PCT}")
 def dq_asset_coverage():
-    dim = spark.read.table("ab_power.gold.dim_asset_current")
+    dim = spark.read.table("gold.dim_asset_current")
     registry = current_asset_ids()
     generation = generation_asset_ids()
 
@@ -248,7 +248,7 @@ def dq_asset_coverage():
     )
 
     active_sources = (
-        spark.read.table("ab_power.silver.dim_asset")
+        spark.read.table("silver.dim_asset")
         .filter(
             F.col("__END_AT").isNull()
             & (F.lower("operating_status") == "active")
@@ -301,7 +301,7 @@ def dq_asset_coverage():
 # =====================================================================
 
 @dlt.table(
-    name="ab_power.gold.dq_unmatched_generation_assets",
+    name="gold.dq_unmatched_generation_assets",
     comment=(
         "Data quality: assets that appear in silver.generation_snapshot but have no current "
         "row in silver.dim_asset. Empty is the healthy state."
@@ -310,7 +310,7 @@ def dq_asset_coverage():
 )
 def dq_unmatched_generation_assets():
     return (
-        spark.read.table("ab_power.silver.generation_snapshot")
+        spark.read.table("silver.generation_snapshot")
         .join(current_asset_ids(), on="asset_id", how="left_anti")
         .groupBy("asset_id")
         .agg(
