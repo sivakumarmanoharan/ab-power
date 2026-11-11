@@ -1,0 +1,47 @@
+# CI: runs on every pull request to main.
+# Must pass before a PR can merge (required status check in the main branch ruleset).
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+# A newer push to the same PR cancels the older, now-irrelevant run
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate code and bundle
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Cheap first gate: every Python file must at least parse
+      - name: Check Python syntax
+        run: python -m compileall -q src
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      # Checks both targets resolve: YAML, variables, resource references, file paths
+      - name: Validate bundle (dev)
+        run: databricks bundle validate -t dev
+
+      - name: Validate bundle (prod)
+        run: databricks bundle validate -t prod
