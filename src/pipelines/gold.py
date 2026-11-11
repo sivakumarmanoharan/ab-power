@@ -59,9 +59,12 @@ def fact_hourly_market():
 
 @dlt.table(
     name='ab_power.gold.agg_price_spike_events',
-    comment=f"One row per price spike event: a run of consecutive hours with price > "
-        f"{SPIKE_MULTIPLIER:g}x the rolling 30-day average and > ${SPIKE_FLOOR:g}/MWh. "
-        f"Includes demand and forecast error during the event.",
+    comment=(
+        f"One row per price spike event: a run of consecutive spike hours as flagged "
+        f"in gold.fact_hourly_market (see that table for the spike rule). "
+        f"Includes demand and forecast error during the event. "
+        f"event_start_utc is the stable identifier; event_id is recalculated on each refresh."
+    ),
     table_properties={
         "quality":"gold"
     }
@@ -121,5 +124,74 @@ def agg_price_spike_events():
                 F.avg(F.col("alberta_internal_load") - F.col("forecast_alberta_internal_load")),
                 0,
             ).alias("avg_forecast_error_mw"),
+        )
+    )
+
+@dlt.table(
+    name="ab_power.gold.dim_asset_current",
+    comment=(
+        "One row per asset, current state only: asset attributes, current participants, "
+        "and fuel type and capability from the asset's latest generation snapshot. "
+        "History is kept in Silver's SCD2 tables."
+    ),
+    table_properties={"quality": "gold"},
+)
+def dim_asset_current():
+    # Step 1: current version of every asset
+    current_assets = (
+        spark.read.table("ab_power.silver.dim_asset")
+        .filter(F.col("__END_AT").isNull())
+        .select(
+            "asset_id", "asset_name", "asset_type", "operating_status",
+            "net_to_grid_asset_flag", "asset_incl_storage_flag",
+            F.col("__START_AT").alias("current_version_since"),
+        )
+    )
+
+    # Step 2: current participants, aggregated to ONE row per asset before joining (no fan-out)
+    current_participants = (
+        spark.read.table("ab_power.silver.dim_participant")
+        .filter(F.col("__END_AT").isNull())
+        .select("pool_participant_id", "pool_participant_name")
+    )
+    participants_per_asset = (
+        spark.read.table("ab_power.silver.bridge_asset_participant")
+        .filter(F.col("__END_AT").isNull())
+        .select("asset_id", "pool_participant_id")
+        .join(current_participants, on="pool_participant_id", how="left")
+        .groupBy("asset_id")
+        .agg(
+            F.count("pool_participant_id").alias("participant_count"),
+            F.array_sort(F.collect_set("pool_participant_id")).alias("pool_participant_ids"),
+            F.array_sort(F.collect_set("pool_participant_name")).alias("pool_participant_names"),
+        )
+    )
+
+    # Step 3: each asset's most recent generation snapshot (row_number: exactly one row, no ties)
+    latest_by_asset = Window.partitionBy("asset_id").orderBy(F.col("snapshot_utc").desc())
+    latest_gen_row = (
+        spark.read.table("ab_power.silver.generation_snapshot")
+        .withColumn("rn", F.row_number().over(latest_by_asset))
+        .filter(F.col("rn") == 1)
+        .select(
+            "asset_id", "fuel_type", "sub_fuel_type",
+            F.col("maximum_capability").alias("maximum_capability_mw"),
+            F.col("snapshot_utc").alias("last_generation_snapshot_utc"),
+        )
+    )
+
+    # Step 4: LEFT JOINs keep every current asset, even with no participants or generation data
+    return (
+        current_assets
+        .join(participants_per_asset, on="asset_id", how="left")
+        .join(latest_gen_row, on="asset_id", how="left")
+        .select(
+            "asset_id", "asset_name", "asset_type", "operating_status",
+            "net_to_grid_asset_flag", "asset_incl_storage_flag", "current_version_since",
+            # No participants -> 0 and empty arrays, not NULL
+            F.coalesce("participant_count", F.lit(0)).alias("participant_count"),
+            F.coalesce("pool_participant_ids", F.array().cast("array<string>")).alias("pool_participant_ids"),
+            F.coalesce("pool_participant_names", F.array().cast("array<string>")).alias("pool_participant_names"),
+            "fuel_type", "sub_fuel_type", "maximum_capability_mw", "last_generation_snapshot_utc",
         )
     )
