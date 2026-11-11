@@ -1,0 +1,40 @@
+resources:
+  jobs:
+    # ADR-014: hourly ingestion, decoupled from the pipeline by the landing Volume
+    ab_power_ingest:
+      name: ab_power_ingest
+      schedule:
+        quartz_cron_expression: "0 5 * * * ?"
+        timezone_id: UTC
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+      tasks:
+        - task_key: land_aeso_files
+          spark_python_task:
+            python_file: ../src/ingestion/ingestion.py
+            parameters: ["--catalog", "${var.catalog}"]
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 300000   # 5 minutes
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+
+    # ADR-014: pipeline every 6 hours, 15 minutes after ingestion
+    ab_power_pipeline_refresh:
+      name: ab_power_pipeline_refresh
+      schedule:
+        quartz_cron_expression: "0 20 0/6 * * ?"
+        timezone_id: UTC
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+      tasks:
+        - task_key: refresh_bronze_silver_gold
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.ab_power_market_pipeline.id}
+            full_refresh: false
+          max_retries: 1
+          min_retry_interval_millis: 600000   # 10 minutes

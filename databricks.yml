@@ -1,0 +1,33 @@
+# Databricks Asset Bundle: everything the project deploys, defined as code.
+# Deploy:  databricks bundle deploy -t dev   (or -t prod)
+# Run:     databricks bundle run ab_power_ingest -t dev
+
+bundle:
+  name: ab_power_lakehouse
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog holding every table and the landing Volume.
+
+targets:
+  # Development: resources are prefixed "[dev <user>]" and schedules are PAUSED,
+  # so a dev deployment never competes with production.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-a80fb7cf-ec84.cloud.databricks.com
+    variables:
+      catalog: ab_power_dev
+
+  # Production: one shared deployment, schedules active.
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-a80fb7cf-ec84.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: ab_power
