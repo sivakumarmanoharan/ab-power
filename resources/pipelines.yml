@@ -19,3 +19,5 @@ resources:
             path: ../src/pipelines/gold.py
         - file:
             path: ../src/pipelines/quality.py
+      lifecycle:
+        prevent_destroy: true
