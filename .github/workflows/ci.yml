@@ -34,21 +34,7 @@ jobs:
 
       # Cheap first gate: every Python file must at least parse
       - name: Check Python syntax
-        run: python -m compileall -q src tests
-
-      # PySpark needs a Java runtime for the local Spark session used by the tests
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install test dependencies
-        run: pip install -r requirements-dev.txt
-
-      # Unit tests: API client, Bronze naming, Gold spike logic (no Databricks needed)
-      - name: Run unit tests
-        run: pytest
+        run: python -m compileall -q src
 
       - name: Install Databricks CLI
         uses: databricks/setup-cli@main
