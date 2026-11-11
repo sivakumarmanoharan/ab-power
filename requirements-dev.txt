@@ -1,0 +1,4 @@
+# Local and CI test dependencies (not needed by the pipeline itself)
+pytest==8.3.4
+pyspark==3.5.3
+requests==2.32.3
