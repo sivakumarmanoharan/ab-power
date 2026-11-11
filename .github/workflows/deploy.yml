@@ -1,0 +1,45 @@
+# CD: deploys production when a pull request is merged into main.
+# Production only ever runs code that passed CI and review.
+
+name: Deploy to production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # manual "Run workflow" button, e.g. to redeploy after rotating the token
+
+# Never run two production deploys at once; queue instead of cancelling a deploy mid-way
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy bundle to prod
+    runs-on: ubuntu-latest
+    environment: production   # GitHub environment: shows deployment history; can require approval
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Validate bundle (prod)
+        run: databricks bundle validate -t prod
+
+      # Updates the bound production pipeline and jobs in place (ADR-019)
+      - name: Deploy bundle (prod)
+        run: databricks bundle deploy -t prod
+
+      # Smoke test: checks the deployed code against the real tables without writing anything.
+      # Catches broken code now, instead of at the next scheduled run.
+      - name: Validate deployed pipeline (no writes)
+        run: databricks bundle run ab_power_market_pipeline -t prod --validate-only
